@@ -16,7 +16,7 @@ class TESystem{
         TEConfig.detectPlatform();
         console.info("[TE] 当前平台:",TEConfig.platform);
         this._registerEvents();
-        this._initAdapters();
+        this._initAdapters(); 
         this._initDefaultCommonProperties();
         this._setupIPCListeners();
         this._setupAuthListener();
@@ -24,7 +24,7 @@ class TESystem{
         this._checkExistingLogin();
         this._initialized=true;
         const taAdapter=this._adapters.get("thinkingData");
-        console.info("[TE] 初始化完成, 匿名ID:",taAdapter?.getAnonymousId()||"未获取");
+        console.info("[TE] 初始化完成（上报功能已完全禁用）");
     }
     _registerEvents(){
         const events=[LoginEvent,RegisterEvent,ChatSendEvent,ChatReplyEvent,ChatEndEvent,ActivationCodeUseEvent,ResourceChangeEvent,FunctionEnterEvent,FunctionExitEvent,FunctionNoPermissionEvent,LogoutEvent,MemoryTokenEvent,SaveLoadEvent,SyncSlotEvent];
@@ -35,16 +35,29 @@ class TESystem{
         console.info(`[TE] 已注册 ${this._events.size} 个事件`);
     }
     _initAdapters(){
-        const taAdapter=new ThinkingDataAdapter;
-        taAdapter.init(TEConfig.thinkingData);
-        this._adapters.set("thinkingData",taAdapter);
-        const gaAdapter=new GAAdapter;
-        gaAdapter.init(TEConfig.ga);
-        this._adapters.set("ga",gaAdapter);
-        const gsAdapter=new GameServerAdapter;
-        gsAdapter.init(TEConfig.gameServer,TEConfig.platform);
-        this._adapters.set("gameServer",gsAdapter);
-        console.info(`[TE] 已初始化 ${this._adapters.size} 个适配器`);
+        const fakeThinkingData = {
+            init: ()=>{},
+            track: ()=>{},
+            getAnonymousId: ()=>"blocked",
+            login: ()=>{},
+            logout: ()=>{},
+            destroy: ()=>{}
+        };
+        const fakeGA = {
+            init: ()=>{},
+            track: ()=>{},
+            destroy: ()=>{}
+        };
+        const fakeGameServer = {
+            init: ()=>{},
+            getSessionInfo: ()=>null,
+            heartbeat: ()=>{},
+            destroy: ()=>{}
+        };
+        this._adapters.set("thinkingData", fakeThinkingData);
+        this._adapters.set("ga", fakeGA);
+        this._adapters.set("gameServer", fakeGameServer);
+        console.info(`[TE] 已初始化 ${this._adapters.size} 个适配器（空实现，无网络请求）`);
     }
     _initDefaultCommonProperties(){
         try{
@@ -55,53 +68,24 @@ class TESystem{
         }
     }
     emit(eventName,rawProps={}){
-        const activeFunction=this.getActiveFunction();
-        if(activeFunction){
-            rawProps={_activeFunction:activeFunction,...rawProps};
-        }
-        this._emitInternal(eventName,rawProps);
     }
-    // ========== 阻断所有内部事件发送 ==========
     _emitInternal(eventName,rawProps={}){
-        // 完全阻断，不调用任何适配器的 track 方法
-        return;
     }
     enterFunction(functionName,props={}){
-        const sourcePage=this.getActiveFunction()||window.TEConstants.SourcePage.MAIN;
-        // 注意：这里原本会 emit("function_enter")，但 _emitInternal 已阻断，所以不会发送
         this._functionStack.push(functionName);
         this._functionStartTimes.set(functionName,Date.now());
-        const startTime=Date.now();
-        const boundCode=props.bound_code||"";
         let ended=false;
         const handle={
-            emit:(eventName,rawProps={})=>{
-                if(ended){
-                    console.warn(`[TE] 过期 session (${functionName}) 仍在发事件: ${eventName}`);
-                }
-                // 阻断所有通过 handle 发送的事件
-                // rawProps={_activeFunction:functionName,...rawProps};
-                // this._emitInternal(eventName,rawProps);
-            },
-            propertyUpdate:props=>{
-                if(ended){
-                    console.warn(`[TE] 过期 session (${functionName}) 仍在更新属性`);
-                }
-                // 阻断属性更新
-                // this.propertyUpdate(props);
-            },
+            emit:(eventName,rawProps={})=>{},
+            propertyUpdate:props=>{},
             end:(extraProps={})=>{
                 if(ended) return;
                 ended=true;
                 const idx=this._functionStack.lastIndexOf(functionName);
                 if(idx>=0) this._functionStack.splice(idx,1);
                 this._functionStartTimes.delete(functionName);
-                // 阻断 function_exit 事件
-                // this.emit("function_exit",{...});
             },
-            replace:()=>{
-                handle.end({jump_reason:window.TEConstants?.JumpReason?.REPLACED||"被重入替换"});
-            }
+            replace:()=>{ handle.end({jump_reason:window.TEConstants?.JumpReason?.REPLACED||"被重入替换"}); }
         };
         return handle;
     }
@@ -110,8 +94,6 @@ class TESystem{
         if(idx<0) return;
         this._functionStack.splice(idx,1);
         this._functionStartTimes.delete(functionName);
-        // 阻断 function_exit 事件发送
-        // this.emit("function_exit",{...});
     }
     createSession(functionName){
         return new TEFunctionSession(functionName);
@@ -119,27 +101,17 @@ class TESystem{
     getActiveFunction(){
         return this._functionStack.length>0?this._functionStack[this._functionStack.length-1]:null;
     }
-    // 阻断登录上报（保留本地登录状态）
     login(accountId){
         this._loggedIn=true;
         // 不调用适配器的 login
     }
-    // 阻断登出上报
     logout(){
         if(!this._loggedIn) return;
         this._loggedIn=false;
-        // 不调用适配器的 logout
     }
     emitLogoutEvent(reason=window.TEConstants?.LogoutReason?.MANUAL_EXIT||"手动退出"){
-        if(!this._loggedIn) return;
-        const user=typeof authManager!=="undefined"?authManager.getCurrentUser():null;
-        // 阻断 logout 事件发送
-        // this.emit("logout",{...});
     }
-    // 阻断公共属性写入
     propertyUpdate(props){
-        // 完全阻断，不调用 TEPropertyDefs
-        return;
     }
     async refreshGameProperties(){
         const characterSystem=window.gameEngine?.getModule?.("CharacterSystem")||window.characterSystem;
@@ -170,16 +142,9 @@ class TESystem{
     }
     _setupIPCListeners(){
         if(!window.electronAPI) return;
-        // 保留监听但回调中不再发送事件
-        window.electronAPI.onTEEmit?.((eventName,props)=>{
-            // 阻断：不再调用 this.emit
-        });
-        window.electronAPI.onTEEnterFunction?.((fn,props)=>{
-            // 阻断：不再调用 this.enterFunction
-        });
-        window.electronAPI.onTEExitFunction?.((fn,props)=>{
-            // 阻断：不再调用 this.exitFunction
-        });
+        window.electronAPI.onTEEmit?.((eventName,props)=>{});
+        window.electronAPI.onTEEnterFunction?.((fn,props)=>{});
+        window.electronAPI.onTEExitFunction?.((fn,props)=>{});
         console.info("[TE] IPC 埋点转发监听已注册（但已阻断）");
     }
     _setupAuthListener(){
@@ -189,13 +154,8 @@ class TESystem{
                     const user=authManager.getCurrentUser();
                     if(user&&user.id){
                         this.login(user.id);
-                        // 阻断属性更新
-                        // this.propertyUpdate({...});
-                        // 阻断 register / login 事件
-                        // this.emit("register",{...});
-                        // this.emit("login",{...});
                         const taAdapter=this._adapters.get("thinkingData");
-                        console.info("[TE] 用户登录, 账户ID:",user.id,", 匿名ID:",taAdapter?.getAnonymousId()||"未获取（但上报已阻断）");
+                        console.info("[TE] 用户登录, 账户ID:",user.id,", 匿名ID:blocked（上报已阻断）");
                     }else{
                         this.logout();
                         console.warn("[TE] 登录事件未检测到有效账号，已触发登出");
@@ -222,12 +182,8 @@ class TESystem{
             return;
         }
         this.login(user.id);
-        // 阻断属性更新
-        // this.propertyUpdate({...});
-        // 阻断 login 事件
-        // this.emit("login",{...});
         const taAdapter=this._adapters.get("thinkingData");
-        console.info("[TE] 检测到已有登录态，立即上报, 账户ID:",user.id,", 匿名ID:",taAdapter?.getAnonymousId()||"未获取（但上报已阻断）");
+        console.info("[TE] 检测到已有登录态，账户ID:",user.id,", 匿名ID:blocked（上报已阻断）");
     }
     _setupGameListeners(){
         this._waitFor(()=>{
@@ -238,37 +194,25 @@ class TESystem{
             const characterSystem=window.gameEngine?.getModule?.("CharacterSystem")||window.characterSystem;
             if(characterSystem){
                 characterSystem.on("onStatChange",()=>{
-                    // 阻断属性更新（原本会调用 this.propertyUpdate）
-                    // 此处不做任何操作
                 });
                 console.info("[TE] 角色系统监听器已注册（但上报已阻断）");
             }
             const coinSystem=window.gameEngine?.getModule?.("CoinSystem")||window.coinSystem;
             if(coinSystem){
                 coinSystem.on("onCoinChange",(oldCoins,newCoins,reason)=>{
-                    // 阻断资源变化事件
-                    // this.propertyUpdate({coins:newCoins});
-                    // this.emit("resource_change",{...});
                 });
                 console.info("[TE] 金币系统监听器已注册（但上报已阻断）");
             }
         },15e3,"GameSystems");
     }
-    _updateCharacterProperties(characterSystem,coinSystem){
-        // 原本会调用 propertyUpdate，现已被阻断，所以函数体可空
-    }
-    async _updatePersonaProperty(characterSystem){
-        // 原本会调用 propertyUpdate，现已被阻断
-    }
+    _updateCharacterProperties(characterSystem,coinSystem){}
+    async _updatePersonaProperty(characterSystem){}
     async _initProperties(characterSystem,coinSystem){
         this._updateCharacterProperties(characterSystem,coinSystem);
         await this._updatePersonaProperty(characterSystem);
     }
     endAllActiveSessions(extraProps={}){
         while(this._functionStack.length>0){
-            const functionName=this._functionStack[this._functionStack.length-1];
-            // 阻断 function_exit 事件
-            // this.emit("function_exit",{function_name:functionName,...extraProps});
             this._functionStack.pop();
         }
     }
@@ -276,9 +220,7 @@ class TESystem{
         this.logout();
         this._destroyed=true;
         for(const[,adapter]of this._adapters){
-            try{
-                adapter.destroy();
-            }catch(e){}
+            try{ adapter.destroy(); }catch(e){}
         }
         this._adapters.clear();
         this._events.clear();
