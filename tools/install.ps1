@@ -67,7 +67,6 @@ function Patch-InstallHooks {
 
     $needle = "const Module = require('module');"
     $block = @'
-
 // YUKI_VISION_MOD_BLOCK_START
 function yukiVisionModFileUrl(fileName) {
   try {
@@ -193,6 +192,326 @@ function installYukiVisionRealtimeMainHook() {
         $content = $content.Replace($needle, "$needle`r`n$block")
     }
 
+    $findOverrideFunc = @'
+function findOverridePath(appDir, relPath) {
+  const overrideRoot = path.join(appDir, 'overrides');
+  const candidates = lookupCandidatesFromRelative(relPath);
+  for (const candidate of candidates) {
+    const overridePath = path.join(overrideRoot, ...candidate.split('/'));
+    if (fs.existsSync(overridePath)) {
+      return overridePath;
+    }
+  }
+  return null;
+}
+'@
+    if ($content -notmatch "function findOverridePath") {
+        $content = $content -replace '(return Array\.from\(new Set\(out\)\);\s*\})', "`$1`r`n`r`n$findOverrideFunc"
+    }
+
+    $newInstallFsAndModuleHooks = @'
+function installFsAndModuleHooks(cryptoModule, appDir) {
+  const originalReadFileSync = fs.readFileSync;
+  const originalResolveFilename = Module._resolveFilename;
+  const originalJsLoader = Module._extensions['.js'];
+  const originalJsonLoader = Module._extensions['.json'];
+
+  function resolveVirtualModuleFilename(request, parent) {
+    if (typeof request !== 'string' || !request) {
+      return null;
+    }
+
+    const isRelative = request.startsWith('./') || request.startsWith('../');
+    const isAbsolute = path.isAbsolute(request);
+    if (!isRelative && !isAbsolute) {
+      return null;
+    }
+
+    const baseDir = isAbsolute
+      ? appDir
+      : path.dirname((parent && parent.filename) ? parent.filename : path.join(appDir, 'main.js'));
+
+    const requestedAbs = isAbsolute
+      ? path.normalize(request)
+      : path.normalize(path.resolve(baseDir, request));
+
+    const candidates = [];
+    if (path.extname(requestedAbs)) {
+      candidates.push(requestedAbs);
+    } else {
+      candidates.push(requestedAbs);
+      candidates.push(`${requestedAbs}.js`);
+      candidates.push(`${requestedAbs}.json`);
+      candidates.push(path.join(requestedAbs, 'index.js'));
+      candidates.push(path.join(requestedAbs, 'index.json'));
+    }
+
+    for (const candidate of candidates) {
+      const rel = toRelativePosix(appDir, candidate);
+      if (rel.startsWith('..')) {
+        continue;
+      }
+      if (findOverridePath(appDir, rel)) {
+        return candidate;
+      }
+      if (hasMappedDecryptedFile(cryptoModule, rel)) {
+        return candidate;
+      }
+    }
+
+    return null;
+  }
+
+  fs.readFileSync = function patchedReadFileSync(filePath, options) {
+    const abs = resolveFilePath(filePath);
+    if (!abs) {
+      return originalReadFileSync.apply(this, arguments);
+    }
+
+    const rel = toRelativePosix(appDir, abs);
+    if (rel.startsWith('..')) {
+      return originalReadFileSync.apply(this, arguments);
+    }
+
+    const overridePath = findOverridePath(appDir, rel);
+    if (overridePath) {
+      const data = originalReadFileSync.call(fs, overridePath);
+      console.warn('[OverrideHit:FS]', rel, '=>', overridePath);
+      return encodeByOption(data, normalizeEncoding(options));
+    }
+
+    if (hasMappedDecryptedFile(cryptoModule, rel)) {
+      const data = getMappedDecryptedBuffer(cryptoModule, rel);
+      return encodeByOption(data, normalizeEncoding(options));
+    }
+
+    return originalReadFileSync.apply(this, arguments);
+  };
+
+  Module._resolveFilename = function patchedResolveFilename(request, parent, isMain, options) {
+    const virtual = resolveVirtualModuleFilename(request, parent);
+    if (virtual) {
+      return virtual;
+    }
+    return originalResolveFilename.call(this, request, parent, isMain, options);
+  };
+
+  Module._extensions['.js'] = function patchedJsLoader(mod, filename) {
+    const rel = toRelativePosix(appDir, filename);
+    if (!rel.startsWith('..')) {
+      const overridePath = findOverridePath(appDir, rel);
+      if (overridePath) {
+        const source = originalReadFileSync.call(fs, overridePath, 'utf8');
+        console.warn('[OverrideHit:JS]', rel, '=>', overridePath);
+        mod._compile(source, filename);
+        return;
+      }
+    }
+    if (!rel.startsWith('..') && hasMappedDecryptedFile(cryptoModule, rel)) {
+      const source = getMappedDecryptedText(cryptoModule, rel);
+      mod._compile(source, filename);
+      return;
+    }
+    originalJsLoader(mod, filename);
+  };
+
+  Module._extensions['.json'] = function patchedJsonLoader(mod, filename) {
+    const rel = toRelativePosix(appDir, filename);
+    if (!rel.startsWith('..')) {
+      const overridePath = findOverridePath(appDir, rel);
+      if (overridePath) {
+        const source = originalReadFileSync.call(fs, overridePath, 'utf8');
+        console.warn('[OverrideHit:JSON]', rel, '=>', overridePath);
+        mod.exports = JSON.parse(source);
+        return;
+      }
+    }
+    if (!rel.startsWith('..') && hasMappedDecryptedFile(cryptoModule, rel)) {
+      const source = getMappedDecryptedText(cryptoModule, rel);
+      mod.exports = JSON.parse(source);
+      return;
+    }
+    originalJsonLoader(mod, filename);
+  };
+}
+'@
+    $oldInstallFsAndModuleHooksPattern = '(?s)(function installFsAndModuleHooks\(cryptoModule, appDir\) \{.*?\n\})'
+    if ($content -match $oldInstallFsAndModuleHooksPattern) {
+        $content = $content -replace $oldInstallFsAndModuleHooksPattern, $newInstallFsAndModuleHooks
+    }
+
+    $newInstallProtocolHook = @'
+function installProtocolHook(cryptoModule, appDir) {
+  const { app, session } = require('electron');
+
+  const installedSessions = new WeakSet();
+
+  function serveFileResponse(filePath, rel, request) {
+    let content;
+    try {
+      content = fs.readFileSync(filePath);
+    } catch (_) {
+      return new Response('Not Found', { status: 404 });
+    }
+
+    content = applyYukiVisionModToBuffer(rel, content);
+    const contentType = getContentTypeByPath(rel);
+    const totalSize = content.length;
+    const rangeHeader = request.headers.get('range');
+
+    if (rangeHeader) {
+      const match = rangeHeader.match(/bytes=(\d+)-(\d*)/);
+      if (match) {
+        const start = parseInt(match[1], 10);
+        const end = match[2] ? parseInt(match[2], 10) : totalSize - 1;
+        const clampedEnd = Math.min(end, totalSize - 1);
+        const chunk = content.slice(start, clampedEnd + 1);
+        return new Response(chunk, {
+          status: 206,
+          headers: {
+            'content-type': contentType,
+            'content-range': `bytes ${start}-${clampedEnd}/${totalSize}`,
+            'accept-ranges': 'bytes',
+            'content-length': String(chunk.length),
+          },
+        });
+      }
+    }
+
+    return new Response(content, {
+      status: 200,
+      headers: {
+        'content-type': contentType,
+        'content-length': String(totalSize),
+        'accept-ranges': 'bytes',
+      },
+    });
+  }
+
+  async function registerOnSession(targetSession) {
+    if (!targetSession || installedSessions.has(targetSession)) {
+      return;
+    }
+
+    const protocolApi = targetSession.protocol;
+    if (await protocolApi.isProtocolHandled('file')) {
+      await protocolApi.unhandle('file');
+    }
+
+    await protocolApi.handle('file', async (request) => {
+      const url = new URL(request.url);
+      let pathname = decodeURIComponent(url.pathname);
+      if (process.platform === 'win32' && /^\/[A-Za-z]:/.test(pathname)) {
+        pathname = pathname.slice(1);
+      }
+
+      const filePath = path.normalize(pathname);
+      const rel = toRelativePosix(appDir, filePath);
+
+      if (!rel.startsWith('..')) {
+        const overridePath = findOverridePath(appDir, rel);
+        if (overridePath) {
+          const body = fs.readFileSync(overridePath);
+          console.warn('[OverrideHit:PROTO]', rel, '=>', overridePath);
+          return new Response(body, {
+            headers: {
+              'content-type': getContentTypeByPath(rel),
+              'content-length': String(body.length),
+              'cache-control': 'no-store',
+            },
+          });
+        }
+      }
+
+      if (!rel.startsWith('..') && hasMappedDecryptedFile(cryptoModule, rel)) {
+        const body = getMappedDecryptedBuffer(cryptoModule, rel);
+        return new Response(body, {
+          headers: {
+            'content-type': getContentTypeByPath(rel),
+            'content-length': String(body.length),
+            'cache-control': 'no-store',
+          },
+        });
+      }
+
+      return serveFileResponse(filePath, rel, request);
+    });
+
+    installedSessions.add(targetSession);
+  }
+
+  async function registerFileInterceptor() {
+    await registerOnSession(session.defaultSession);
+    await registerOnSession(session.fromPartition('persist:launcher'));
+    await registerOnSession(session.fromPartition('persist:main'));
+  }
+
+  const onError = (error) => {
+    console.error('[Encryption] file protocol hook registration failed:', error && error.message ? error.message : error);
+  };
+
+  if (app.isReady()) {
+    registerFileInterceptor().catch(onError);
+    return;
+  }
+
+  app.whenReady().then(() => registerFileInterceptor().catch(onError));
+}
+'@
+    $oldInstallProtocolHookPattern = '(?s)(function installProtocolHook\(cryptoModule, appDir\) \{.*?\n\})'
+    if ($content -match $oldInstallProtocolHookPattern) {
+        $content = $content -replace $oldInstallProtocolHookPattern, $newInstallProtocolHook
+    }
+
+    $newRunMainFromMemory = @'
+function runMainFromMemory(cryptoModule, appDir, mainRelativePath) {
+  const mainRel = (mainRelativePath || 'main.js').split('\\').join('/');
+  const overridePath = findOverridePath(appDir, mainRel);
+  const source = overridePath
+    ? fs.readFileSync(overridePath, 'utf8')
+    : getMappedDecryptedText(cryptoModule, mainRel);
+  if (overridePath) {
+    console.warn('[OverrideHit:MAIN]', mainRel, '=>', overridePath);
+  }
+
+  const virtualAsarRoot = path.join(appDir, 'app.asar');
+  const mainAbs = path.join(virtualAsarRoot, ...mainRel.split('/'));
+  const mainModule = new Module(mainAbs, null);
+  mainModule.filename = mainAbs;
+  mainModule.paths = Module._nodeModulePaths(path.dirname(mainAbs));
+  process.mainModule = mainModule;
+  require.main = mainModule;
+  mainModule._compile(source, mainAbs);
+}
+'@
+    $oldRunMainFromMemoryPattern = '(?s)(function runMainFromMemory\(cryptoModule, appDir, mainRelativePath\) \{.*?\n\})'
+    if ($content -match $oldRunMainFromMemoryPattern) {
+        $content = $content -replace $oldRunMainFromMemoryPattern, $newRunMainFromMemory
+    }
+
+    $newBootstrapAll = @'
+function bootstrapAll(cryptoModule, appDir, mainRelativePath, payloadRoot) {
+  if (!cryptoModule || typeof cryptoModule.bootstrap !== 'function') {
+    throw new Error('invalid crypto module');
+  }
+  if (!appDir || typeof appDir !== 'string') {
+    throw new Error('invalid appDir');
+  }
+
+  cryptoModule.bootstrap(payloadRoot || appDir);
+  installFsAndModuleHooks(cryptoModule, appDir);
+  installProtocolHook(cryptoModule, appDir);
+  runMainFromMemory(cryptoModule, appDir, mainRelativePath || 'main.js');
+  if (typeof installYukiVisionRealtimeMainHook === 'function') {
+    installYukiVisionRealtimeMainHook();
+  }
+}
+'@
+    $oldBootstrapAllPattern = '(?s)(function bootstrapAll\(cryptoModule, appDir, mainRelativePath, payloadRoot\) \{.*?\n\})'
+    if ($content -match $oldBootstrapAllPattern) {
+        $content = $content -replace $oldBootstrapAllPattern, $newBootstrapAll
+    }
+
     $oldBufferLine = "      return Buffer.from(cryptoModule.getDecryptedFile(candidate));"
     $newBufferLine = @'
       const rawBuffer = Buffer.from(cryptoModule.getDecryptedFile(candidate));
@@ -218,17 +537,6 @@ function installYukiVisionRealtimeMainHook() {
 '@
     if ($content.Contains($oldServeLine) -and $content -notmatch "content = applyYukiVisionModToBuffer\(rel, content\);") {
         $content = $content.Replace($oldServeLine, $newServeLine)
-    }
-
-    $oldRunMainLine = "  runMainFromMemory(cryptoModule, appDir, mainRelativePath || 'main.js');"
-    $newRunMainLine = @'
-  runMainFromMemory(cryptoModule, appDir, mainRelativePath || 'main.js');
-  if (typeof installYukiVisionRealtimeMainHook === 'function') {
-    installYukiVisionRealtimeMainHook();
-  }
-'@
-    if ($content.Contains($oldRunMainLine) -and $content -notmatch "installYukiVisionRealtimeMainHook\(\);") {
-        $content = $content.Replace($oldRunMainLine, $newRunMainLine)
     }
 
     if ($content -notmatch "applyYukiVisionModToBuffer\(candidate, rawBuffer\)" -or
